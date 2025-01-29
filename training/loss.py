@@ -22,20 +22,41 @@ class VPLoss:
         self.beta_d = beta_d
         self.beta_min = beta_min
         self.epsilon_t = epsilon_t
-
-    def __call__(self, net, images, labels, augment_pipe=None):
+        
+       
+    def __call__(self, net, images, labels, augment_pipe=None, C=None, **kwargs):
         rnd_uniform = torch.rand([images.shape[0], 1, 1, 1], device=images.device)
         sigma = self.sigma(1 + rnd_uniform * (self.epsilon_t - 1))
         weight = 1 / sigma ** 2
         y, augment_labels = augment_pipe(images) if augment_pipe is not None else (images, None)
-        n = torch.randn_like(y) * sigma
-        D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        M = 1000
+        
+        if C is None:    
+            if not kwargs.gaussian:
+                steps = (rnd_uniform[:, 0, 0, 0] * M).round()
+            else:
+                steps = None # no effect on the Gaussian noise
+            n = kwargs['noise_fn'](y, steps) * sigma
+            D_yn = net(y + n, sigma, labels, augment_labels=augment_labels)
+        else:
+            sigma_t = sigma # for the sigma_inv to calculate time t
+            C = kwargs['a'] * C + kwargs['b']
+            W = C.exp()
+            # sigma with shape n, 1, 1, 1
+            # C with shape n, c, h, w
+            sigma = sigma * (C.sqrt()/W)
+            n = torch.randn_like(y) * sigma
+            # print(f"sigma: {sigma.shape}, sigma_t: {sigma_t.shape}, n: {n.shape}, y: {y.shape}", flush=True)
+            D_yn = net(y + n, (sigma, sigma_t), labels, augment_labels=augment_labels)
+     
         loss = weight * ((D_yn - y) ** 2)
         return loss
 
     def sigma(self, t):
         t = torch.as_tensor(t)
         return ((0.5 * self.beta_d * (t ** 2) + self.beta_min * t).exp() - 1).sqrt()
+    
+    
 
 #----------------------------------------------------------------------------
 # Loss function corresponding to the variance exploding (VE) formulation
@@ -64,7 +85,7 @@ class VELoss:
 
 @persistence.persistent_class
 class EDMLoss:
-    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5): # sigma_data=0.368 
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data

@@ -19,6 +19,7 @@ import dnnlib
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import misc
+from torchvision.utils import make_grid
 
 #----------------------------------------------------------------------------
 
@@ -46,6 +47,8 @@ def training_loop(
     resume_kimg         = 0,        # Start from the given training progress.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+    custom_kwargs       = {},       # Custom op implementations.
+    
 ):
     # Initialize.
     start_time = time.time()
@@ -68,7 +71,11 @@ def training_loop(
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs) # subclass of training.dataset.Dataset
     dataset_sampler = misc.InfiniteSampler(dataset=dataset_obj, rank=dist.get_rank(), num_replicas=dist.get_world_size(), seed=seed)
     dataset_iterator = iter(torch.utils.data.DataLoader(dataset=dataset_obj, sampler=dataset_sampler, batch_size=batch_gpu, **data_loader_kwargs))
-
+    
+    # save the first batch of images for debugging
+    if dist.get_rank() == 0:
+        misc.save_first_batch(dataset_iterator, run_dir)
+    
     # Construct network.
     dist.print0('Constructing network...')
     interface_kwargs = dict(img_resolution=dataset_obj.resolution, img_channels=dataset_obj.num_channels, label_dim=dataset_obj.label_dim)
@@ -107,6 +114,26 @@ def training_loop(
         misc.copy_params_and_buffers(src_module=data['net'], dst_module=net, require_all=True)
         optimizer.load_state_dict(data['optimizer_state'])
         del data # conserve memory
+        
+    # Noise setup
+    if custom_kwargs.gaussian:
+        noise_fn = lambda x, t=None: torch.randn_like(x)
+    else:
+        from noise.noise import generate_simplex_noise
+        from noise.simplex import Simplex_CLASS
+        simplex = Simplex_CLASS()
+        noise_fn = lambda x, t: generate_simplex_noise(
+                                                        simplex,
+                                                        x,
+                                                        t,
+                                                        False,
+                                                        in_channels=1,
+                                                        octave=6,
+                                                        persistence=0.8,
+                                                        frequency=64,
+                                                        )
+    custom_kwargs.noise_fn = noise_fn
+
 
     # Train.
     dist.print0(f'Training for {total_kimg} kimg...')
@@ -124,10 +151,27 @@ def training_loop(
         optimizer.zero_grad(set_to_none=True)
         for round_idx in range(num_accumulation_rounds):
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
-                images, labels = next(dataset_iterator)
-                images = images.to(device).to(torch.float32) / 127.5 - 1
+                data, labels = next(dataset_iterator)
+                
+                # images = images.to(device).to(torch.float32) / 127.5 - 1
+                
+                # for my custom preprocessed medical imaging dataset
+                # original divided by 99th percentile and clip to [0, 1]
+                images, C = data[0], data[2]
+                images = images.to(device).to(torch.float32) * 2 - 1
+                
+                #TODO: abstract
+                if custom_kwargs.grad:
+                    C = C.to(device).to(torch.float32)
+                    C = (C - C.max()).abs() # low frequency component has higher value
+                    C = C / 5.27 # 98th percentile (max)
+                else:
+                    C = None
+                ########################################################
+                
                 labels = labels.to(device)
-                loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                # loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe)
+                loss = loss_fn(net=ddp, images=images, labels=labels, augment_pipe=augment_pipe, C=C, **custom_kwargs)
                 training_stats.report('Loss/loss', loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
 
@@ -214,3 +258,4 @@ def training_loop(
     dist.print0('Exiting...')
 
 #----------------------------------------------------------------------------
+

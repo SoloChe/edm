@@ -94,13 +94,19 @@ class Dataset(torch.utils.data.Dataset):
             image = self._load_raw_image(raw_idx)
             if self._cache:
                 self._cached_images[raw_idx] = image
-        assert isinstance(image, np.ndarray)
-        assert list(image.shape) == self.image_shape
-        assert image.dtype == np.uint8
+                
+        # assert isinstance(image, np.ndarray)
+        # assert list(image.shape) == self.image_shape
+        
+        # need to comment out the following line to work with my custom preprocessed medical imaging dataset
+        # uint8 rounding should not be done for my dataset
+        # assert image.dtype == np.uint8
+        
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
-        return image.copy(), self.get_label(idx)
+        # return image.copy(), self.get_label(idx)
+        return image, self.get_label(idx)
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
@@ -185,11 +191,23 @@ class ImageFolderDataset(Dataset):
 
         PIL.Image.init()
         self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+
+        # for my custom preprocessed medical imaging dataset
+        if len(self._image_fnames) == 0:
+            self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in ['.npz', '.npy'])
+        ####################################################
+        
         if len(self._image_fnames) == 0:
             raise IOError('No image files found in the specified path')
 
         name = os.path.splitext(os.path.basename(self._path))[0]
-        raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
+        
+        temp = self._load_raw_image(0)
+        if isinstance(temp, tuple):
+            raw_shape = [len(self._image_fnames)] + list(temp[0].shape)
+        else:
+            raw_shape = [len(self._image_fnames)] + list(temp.shape)
+            
         if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
             raise IOError('Image files do not match the specified resolution')
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
@@ -226,11 +244,28 @@ class ImageFolderDataset(Dataset):
         with self._open_file(fname) as f:
             if self._use_pyspng and pyspng is not None and self._file_ext(fname) == '.png':
                 image = pyspng.load(f.read())
+                
+            # for my custom preprocessed medical imaging dataset
+            elif self._file_ext(fname) in ['.npz', '.npy']:
+                image = np.load(f) # 1, C, H, W . NO UINT8!!!
+                x = image['x']
+                x = x[0,...] # remove the first dimension
+                
+                mask = image['y'] # mask
+                mask = mask[0,...] # remove the first dimension
+                
+                C = image['grad_x'] # gradient map
+                C = C[0, ...] # remove the first dimension
+                
+                image = (x, mask, C)
+            ####################################################
             else:
                 image = np.array(PIL.Image.open(f))
-        if image.ndim == 2:
-            image = image[:, :, np.newaxis] # HW => HWC
-        image = image.transpose(2, 0, 1) # HWC => CHW
+        
+        if self._file_ext(fname) not in ['.npy', '.npz']: # keep original code
+            if image.ndim == 2:
+                image = image[:, :, np.newaxis] # HW => HWC
+            image = image.transpose(2, 0, 1) # HWC => CHW
         return image
 
     def _load_raw_labels(self):

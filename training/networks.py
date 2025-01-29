@@ -494,15 +494,25 @@ class VPPrecond(torch.nn.Module):
 
     def forward(self, x, sigma, class_labels=None, force_fp32=False, **model_kwargs):
         x = x.to(torch.float32)
-        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        
+        if isinstance(sigma, tuple):
+            # sigma for calculating the time from sigma_inv
+            sigma_t = sigma[1].to(torch.float32).reshape(-1, 1, 1, 1)
+            sigma = sigma[0].to(torch.float32) # same shape as x
+        else:
+            sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+            sigma_t = sigma
+        
         class_labels = None if self.label_dim == 0 else torch.zeros([1, self.label_dim], device=x.device) if class_labels is None else class_labels.to(torch.float32).reshape(-1, self.label_dim)
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
 
         c_skip = 1
         c_out = -sigma
         c_in = 1 / (sigma ** 2 + 1).sqrt()
-        c_noise = (self.M - 1) * self.sigma_inv(sigma)
+        c_noise = (self.M - 1) * self.sigma_inv(sigma_t)
 
+        # print(sigma.shape, sigma_t.shape, c_in.shape, c_noise.shape, x.shape, flush=True)
+        
         F_x = self.model((c_in * x).to(dtype), c_noise.flatten(), class_labels=class_labels, **model_kwargs)
         assert F_x.dtype == dtype
         D_x = c_skip * x + c_out * F_x.to(torch.float32)
@@ -638,6 +648,7 @@ class EDMPrecond(torch.nn.Module):
         sigma_min       = 0,                # Minimum supported noise level.
         sigma_max       = float('inf'),     # Maximum supported noise level.
         sigma_data      = 0.5,              # Expected standard deviation of the training data.
+        # sigma_data      = 0.368,              # Expected standard deviation of the BraTS21.
         model_type      = 'DhariwalUNet',   # Class name of the underlying model.
         **model_kwargs,                     # Keyword arguments for the underlying model.
     ):

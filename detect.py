@@ -18,6 +18,12 @@ import torch
 import PIL.Image
 import dnnlib
 from torch_utils import distributed as dist
+from detecting.detecting_loop import detecting_loop
+import dnnlib
+import json
+
+import warnings
+warnings.filterwarnings('ignore', 'Grad strides do not match bucket view strides') # False warning printed by PyTorch 1.12.
 
 #----------------------------------------------------------------------------
 # Proposed EDM sampler (Algorithm 2).
@@ -63,9 +69,9 @@ def edm_sampler(
 # Generalized ablation sampler, representing the superset of all sampling
 # methods discussed in the paper.
 
-def ablation_sampler(
+def ablation_sampler_recon(
     net, latents, class_labels=None, randn_like=torch.randn_like,
-    num_steps=18, sigma_min=None, sigma_max=None, rho=7,
+    steps_noise=100, steps_denoise=None, sigma_min=None, sigma_max=None, rho=7,
     solver='heun', discretization='edm', schedule='linear', scaling='none',
     epsilon_s=1e-3, C_1=0.001, C_2=0.008, M=1000, alpha=1,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
@@ -99,24 +105,30 @@ def ablation_sampler(
     vp_beta_d = 2 * (np.log(sigma_min ** 2 + 1) / epsilon_s - np.log(sigma_max ** 2 + 1)) / (epsilon_s - 1)
     vp_beta_min = np.log(sigma_max ** 2 + 1) - 0.5 * vp_beta_d
 
-    # Define time steps in terms of noise level.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    # Define time steps in terms of noise level. original 1 -> 0, now t_noise -> 0
+    # TODO: modify here to enable steps
+    
+    
+    step_indices = torch.arange(steps_denoise, dtype=torch.float64, device=latents.device) 
     if discretization == 'vp':
-        orig_t_steps = 1 + step_indices / (num_steps - 1) * (epsilon_s - 1)
+        t_noise = 1 + (M-steps_noise) / (M - 1) * (epsilon_s - 1) # starting point of denoising
+        orig_t_steps = t_noise + step_indices / (steps_denoise - 1) * (epsilon_s - t_noise) # [0, steps_denoise] -> [t_noise, 0]
         sigma_steps = vp_sigma(vp_beta_d, vp_beta_min)(orig_t_steps)
-    elif discretization == 've':
-        orig_t_steps = (sigma_max ** 2) * ((sigma_min ** 2 / sigma_max ** 2) ** (step_indices / (num_steps - 1)))
-        sigma_steps = ve_sigma(orig_t_steps)
-    elif discretization == 'iddpm':
-        u = torch.zeros(M + 1, dtype=torch.float64, device=latents.device)
-        alpha_bar = lambda j: (0.5 * np.pi * j / M / (C_2 + 1)).sin() ** 2
-        for j in torch.arange(M, 0, -1, device=latents.device): # M, ..., 1
-            u[j - 1] = ((u[j] ** 2 + 1) / (alpha_bar(j - 1) / alpha_bar(j)).clip(min=C_1) - 1).sqrt()
-        u_filtered = u[torch.logical_and(u >= sigma_min, u <= sigma_max)]
-        sigma_steps = u_filtered[((len(u_filtered) - 1) / (num_steps - 1) * step_indices).round().to(torch.int64)]
-    else:
-        assert discretization == 'edm'
-        sigma_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        
+    # elif discretization == 've':
+    #     orig_t_steps = (sigma_max ** 2) * ((sigma_min ** 2 / sigma_max ** 2) ** (step_indices / (num_steps - 1)))
+    #     sigma_steps = ve_sigma(orig_t_steps)
+    # elif discretization == 'iddpm':
+    #     u = torch.zeros(M + 1, dtype=torch.float64, device=latents.device)
+    #     alpha_bar = lambda j: (0.5 * np.pi * j / M / (C_2 + 1)).sin() ** 2
+    #     for j in torch.arange(M, 0, -1, device=latents.device): # M, ..., 1
+    #         u[j - 1] = ((u[j] ** 2 + 1) / (alpha_bar(j - 1) / alpha_bar(j)).clip(min=C_1) - 1).sqrt()
+    #     u_filtered = u[torch.logical_and(u >= sigma_min, u <= sigma_max)]
+    #     sigma_steps = u_filtered[((len(u_filtered) - 1) / (num_steps - 1) * step_indices).round().to(torch.int64)]
+    # else:
+    #     assert discretization == 'edm'
+    #     sigma_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        
 
     # Define noise level schedule.
     if schedule == 'vp':
@@ -143,7 +155,7 @@ def ablation_sampler(
         s_deriv = lambda t: 0
 
     # Compute final time steps based on the corresponding noise levels.
-    t_steps = sigma_inv(net.round_sigma(sigma_steps))
+    t_steps = sigma_inv(net.round_sigma(sigma_steps)) # round_sigma use torch.as_tensor for dtype and device check
     t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])]) # t_N = 0
 
     # Main sampling loop.
@@ -153,7 +165,7 @@ def ablation_sampler(
         x_cur = x_next
 
         # Increase noise temporarily.
-        gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= sigma(t_cur) <= S_max else 0
+        gamma = min(S_churn / M, np.sqrt(2) - 1) if S_min <= sigma(t_cur) <= S_max else 0
         t_hat = sigma_inv(net.round_sigma(sigma(t_cur) + gamma * sigma(t_cur)))
         x_hat = s(t_hat) / s(t_cur) * x_cur + (sigma(t_hat) ** 2 - sigma(t_cur) ** 2).clip(min=0).sqrt() * s(t_hat) * S_noise * randn_like(x_cur)
 
@@ -165,7 +177,7 @@ def ablation_sampler(
         t_prime = t_hat + alpha * h
 
         # Apply 2nd order correction.
-        if solver == 'euler' or i == num_steps - 1:
+        if solver == 'euler' or i == steps_noise - 1:
             x_next = x_hat + h * d_cur
         else:
             assert solver == 'heun'
@@ -214,14 +226,37 @@ def parse_int_list(s):
 #----------------------------------------------------------------------------
 
 @click.command()
-@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
-@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
-@click.option('--seeds',                   help='Random seeds (e.g. 1,2,5-10)', metavar='LIST',                     type=parse_int_list, default='0-63', show_default=True)
-@click.option('--subdirs',                 help='Create subdirectory for every 1000 seeds',                         is_flag=True)
-@click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
-@click.option('--batch', 'max_batch_size', help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
 
-@click.option('--steps', 'num_steps',      help='Number of sampling steps', metavar='INT',                          type=click.IntRange(min=1), default=18, show_default=True)
+# Data
+@click.option('--dataset_name',            help='Name of the dataset', metavar='STR',                               type=str, required=True)
+@click.option('--data',                    help='Path to the dataset', metavar='ZIP|DIR',                           type=str, required=True)
+# @click.option('--class', 'class_idx',      help='Class label  [default: random]', metavar='INT',                    type=click.IntRange(min=0), default=None)
+@click.option('--batch_size',              help='Maximum batch size', metavar='INT',                                type=click.IntRange(min=1), default=64, show_default=True)
+@click.option('--total_kimg',              help='Total length of the trajectory', metavar='INT',                   type=click.IntRange(min=1), default=1, show_default=True)
+@click.option('--cond',                    help='Train class-conditional model', metavar='BOOL',                    type=bool, default=False, show_default=True)
+@click.option('--workers',                 help='DataLoader worker processes', metavar='INT',                       type=click.IntRange(min=1), default=1, show_default=True)
+
+# Network
+@click.option('--network', 'network_pkl',  help='Network pickle filename', metavar='PATH|URL',                      type=str, required=True)
+
+# Performance-related.
+@click.option('--use_fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
+
+# I/O
+@click.option('--outdir',                  help='Where to save the output images', metavar='DIR',                   type=str, required=True)
+@click.option('--seed',                    help='Random seeds', metavar='INT',                                      type=int, default=0, show_default=True)
+
+# Detection
+@click.option('--steps-noise',             help='noise level', metavar='INT',                                     type=click.IntRange(min=1), default=100, show_default=True)
+@click.option('--steps-denoise',           help='denoising level', metavar='INT',                                 type=click.IntRange(min=1), default=100, show_default=True)
+
+# Custom options.
+@click.option('--a',                       help='gradient map normalization parameter', metavar='FLOAT',            type=float, default=1.0, show_default=True)
+@click.option('--b',                       help='gradient map normalization parameter', metavar='FLOAT',            type=float, default=0.0, show_default=True)
+@click.option('--grad',                    help='Whether use gradient map',             metavar='BOOL',             type=bool, default=False, show_default=True)
+@click.option('--gaussian',                help='Whether use Gaussian noise',           metavar='BOOL',             type=bool, default=True, show_default=True)
+
+# Stochasticity
 @click.option('--sigma_min',               help='Lowest noise level  [default: varies]', metavar='FLOAT',           type=click.FloatRange(min=0, min_open=True))
 @click.option('--sigma_max',               help='Highest noise level  [default: varies]', metavar='FLOAT',          type=click.FloatRange(min=0, min_open=True))
 @click.option('--rho',                     help='Time step exponent', metavar='FLOAT',                              type=click.FloatRange(min=0, min_open=True), default=7, show_default=True)
@@ -230,12 +265,18 @@ def parse_int_list(s):
 @click.option('--S_max', 'S_max',          help='Stoch. max noise level', metavar='FLOAT',                          type=click.FloatRange(min=0), default='inf', show_default=True)
 @click.option('--S_noise', 'S_noise',      help='Stoch. noise inflation', metavar='FLOAT',                          type=float, default=1, show_default=True)
 
+# Solver
 @click.option('--solver',                  help='Ablate ODE solver', metavar='euler|heun',                          type=click.Choice(['euler', 'heun']))
 @click.option('--disc', 'discretization',  help='Ablate time step discretization {t_i}', metavar='vp|ve|iddpm|edm', type=click.Choice(['vp', 've', 'iddpm', 'edm']))
 @click.option('--schedule',                help='Ablate noise schedule sigma(t)', metavar='vp|ve|linear',           type=click.Choice(['vp', 've', 'linear']))
 @click.option('--scaling',                 help='Ablate signal scaling s(t)', metavar='vp|none',                    type=click.Choice(['vp', 'none']))
 
-def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=torch.device('cuda'), **sampler_kwargs):
+# Post reconstruction
+@click.option('--threshold',               help='Threshold for anomaly detection', metavar='FLOAT',                 type=float, default=0.5, show_default=True)
+@click.option('--cc-filter',               help='Connected component filter', metavar='BOOL',                       type=bool, default=False, show_default=True)
+@click.option('--mixed',                   help='Mixed anomaly detection', metavar='BOOL',                          type=bool, default=False, show_default=True)
+
+def main(**kwargs):
     """Generate random images using the techniques described in the paper
     "Elucidating the Design Space of Diffusion-Based Generative Models".
 
@@ -251,67 +292,76 @@ def main(network_pkl, outdir, subdirs, seeds, class_idx, max_batch_size, device=
     torchrun --standalone --nproc_per_node=2 generate.py --outdir=out --seeds=0-999 --batch=64 \\
         --network=https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
     """
+    opts = dnnlib.EasyDict(kwargs) 
     dist.init()
-    num_batches = ((len(seeds) - 1) // (max_batch_size * dist.get_world_size()) + 1) * dist.get_world_size()
-    all_batches = torch.as_tensor(seeds).tensor_split(num_batches)
-    rank_batches = all_batches[dist.get_rank() :: dist.get_world_size()]
-
-    # Rank 0 goes first.
-    if dist.get_rank() != 0:
-        torch.distributed.barrier()
-
-    # Load network.
-    dist.print0(f'Loading network from "{network_pkl}"...')
-    with dnnlib.util.open_url(network_pkl, verbose=(dist.get_rank() == 0)) as f:
-        net = pickle.load(f)['ema'].to(device)
-
-    # Other ranks follow.
-    if dist.get_rank() == 0:
-        torch.distributed.barrier()
-
-    # Loop over batches.
-    dist.print0(f'Generating {len(seeds)} images to "{outdir}"...')
-    for batch_seeds in tqdm.tqdm(rank_batches, unit='batch', disable=(dist.get_rank() != 0)):
-        torch.distributed.barrier()
-        batch_size = len(batch_seeds)
-        if batch_size == 0:
-            continue
-
-        # Pick latents and labels.
-        rnd = StackedRandomGenerator(device, batch_seeds)
-        latents = rnd.randn([batch_size, net.img_channels, net.img_resolution, net.img_resolution], device=device)
-        class_labels = None
-        if net.label_dim:
-            class_labels = torch.eye(net.label_dim, device=device)[rnd.randint(net.label_dim, size=[batch_size], device=device)]
-        if class_idx is not None:
-            class_labels[:, :] = 0
-            class_labels[:, class_idx] = 1
-
-        # Generate images.
-        sampler_kwargs = {key: value for key, value in sampler_kwargs.items() if value is not None}
-        have_ablation_kwargs = any(x in sampler_kwargs for x in ['solver', 'discretization', 'schedule', 'scaling'])
-        sampler_fn = ablation_sampler if have_ablation_kwargs else edm_sampler
-        images = sampler_fn(net, latents, class_labels, randn_like=rnd.randn_like, **sampler_kwargs)
-
-        # Save images.
-        images_np = (images * 127.5 + 128).clip(0, 255).to(torch.uint8).permute(0, 2, 3, 1).cpu().numpy()
+    
+    c = dnnlib.EasyDict(network_pkl=opts.network_pkl, 
+                        run_dir=opts.outdir, 
+                        seed=opts.seed, 
+                        batch_size=opts.batch_size, 
+                        total_kimg=opts.total_kimg,
+                        steps_noise=opts.steps_noise,
+                        steps_denoise=opts.steps_denoise)
+    
+    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=False, cache=False)
+    c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
+    
+    c.recon_kwargs = dnnlib.EasyDict(sigma_min=opts.sigma_min, sigma_max=opts.sigma_max, 
+                                      rho=opts.rho, S_churn=opts.S_churn, S_min=opts.S_min, 
+                                      S_max=opts.S_max, S_noise=opts.S_noise,
+                                      solver=opts.solver, discretization=opts.discretization, 
+                                      schedule=opts.schedule, scaling=opts.scaling)
+    c.custom_kwargs = dnnlib.EasyDict(a=opts.a, b=opts.b, grad=opts.grad, gaussian=opts.gaussian)
+    c.postrecon_kwargs = dnnlib.EasyDict(threshold=opts.threshold, cc_filter=opts.cc_filter, mixed=opts.mixed)
+    
+     # Validate dataset options.
+    try:
+        dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
+        dataset_name = dataset_obj.name
+        c.dataset_kwargs.resolution = dataset_obj.resolution # be explicit about dataset resolution
+        c.dataset_kwargs.max_size = len(dataset_obj) # be explicit about dataset size
+        if opts.cond and not dataset_obj.has_labels:
+            raise click.ClickException('--cond=True requires labels specified in dataset.json')
+        del dataset_obj # conserve memory
+    except IOError as err:
+        raise click.ClickException(f'--data: {err}')
         
-        for seed, image_np in zip(batch_seeds, images_np):
-            image_dir = os.path.join(outdir, f'{seed-seed%1000:06d}') if subdirs else outdir
-            os.makedirs(image_dir, exist_ok=True)
-            
-            
-            if image_np.shape[2] == 4: # for my custom preprocessed medical imaging dataset with 4 modalities
-                # concatenate 4 modalities into 1 image
-                image_np =  np.concatenate((image_np[...,0], image_np[...,1], image_np[...,2], image_np[...,3]), axis=1)
-                image_np = image_np[..., np.newaxis]
-                
-            image_path = os.path.join(image_dir, f'{seed:06d}.png')
-            if image_np.shape[2] == 1:
-                PIL.Image.fromarray(image_np[:, :, 0]).save(image_path)
-                # PIL.Image.fromarray(image_np[:, :, 0], 'L').save(image_path)
-            else:
-                PIL.Image.fromarray(image_np, 'RGB').save(image_path)
+    # Description string.
+    model_name = opts.network_pkl.split('/')[-2]
+    model_idx = model_name.split('-')[0]
+    model_snap = opts.network_pkl.split('/')[-1]
+    model_snap = model_snap.split('-')[0][:6]
+    desc = f'{opts.dataset_name:s}-{model_idx:s}-{model_snap:s}-seed{opts.seed:04d}'
+
+    # Pick output directory.
+    if dist.get_rank() != 0:
+        c.run_dir = None
+    else:
+        prev_run_dirs = []
+        if os.path.isdir(opts.outdir):
+            prev_run_dirs = [x for x in os.listdir(opts.outdir) if os.path.isdir(os.path.join(opts.outdir, x))]
+        prev_run_ids = [re.match(r'^\d+', x) for x in prev_run_dirs]
+        prev_run_ids = [int(x.group()) for x in prev_run_ids if x is not None]
+        cur_run_id = max(prev_run_ids, default=-1) + 1
+        c.run_dir = os.path.join(opts.outdir, f'{cur_run_id:05d}-{desc}')
+        assert not os.path.exists(c.run_dir)
+    
+    # Create output directory.
+    dist.print0('Creating output directory...')
+    if dist.get_rank() == 0:
+        os.makedirs(c.run_dir, exist_ok=True)
+        with open(os.path.join(c.run_dir, 'detecting_options.json'), 'wt') as f:
+            json.dump(c, f, indent=2)
+        dnnlib.util.Logger(file_name=os.path.join(c.run_dir, 'log.txt'), file_mode='a', should_flush=True)
+    
+    
+
+    # Generate images.
+    have_ablation_kwargs = any(x is not None for x in [opts.solver, opts.discretization, opts.schedule, opts.scaling])
+    sampler_fn = ablation_sampler_recon if have_ablation_kwargs else edm_sampler
+    c.sampler_fn = sampler_fn
+
+    detecting_loop(**c)
 
     # Done.
     torch.distributed.barrier()

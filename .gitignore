@@ -1,0 +1,9 @@
+test*
+/datasets/*
+/training-runs/*
+/detecting-runs/*
+__pycache__/
+/slurm_out/*
+/out*/*
+/figs/*
+data*

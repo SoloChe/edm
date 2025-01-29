@@ -42,6 +42,7 @@ def parse_int_list(s):
 
 # Main options.
 @click.option('--outdir',        help='Where to save the results', metavar='DIR',                   type=str, required=True)
+@click.option('--dataset_name',  help='Name of the dataset', metavar='STR',                         type=str, required=True)
 @click.option('--data',          help='Path to the dataset', metavar='ZIP|DIR',                     type=str, required=True)
 @click.option('--cond',          help='Train class-conditional model', metavar='BOOL',              type=bool, default=False, show_default=True)
 @click.option('--arch',          help='Network architecture', metavar='ddpmpp|ncsnpp|adm',          type=click.Choice(['ddpmpp', 'ncsnpp', 'adm']), default='ddpmpp', show_default=True)
@@ -77,6 +78,14 @@ def parse_int_list(s):
 @click.option('--resume',        help='Resume from previous training state', metavar='PT',          type=str)
 @click.option('-n', '--dry-run', help='Print training options and exit',                            is_flag=True)
 
+# Custom options.
+@click.option('--a',            help='gradient map normalization parameter', metavar='FLOAT',      type=float, default=1.0, show_default=True)
+@click.option('--b',            help='gradient map normalization parameter', metavar='FLOAT',      type=float, default=0.0, show_default=True)
+@click.option('--grad',         help='Whether use gradient map',             metavar='BOOL',       type=bool, default=False, show_default=True)
+@click.option('--gaussian',     help='Whether use Gaussian noise',           metavar='BOOL',       type=bool, default=True, show_default=True)
+
+
+
 def main(**kwargs):
     """Train diffusion-based generative model using the techniques described in the
     paper "Elucidating the Design Space of Diffusion-Based Generative Models".
@@ -91,7 +100,6 @@ def main(**kwargs):
     opts = dnnlib.EasyDict(kwargs)
     torch.multiprocessing.set_start_method('spawn')
     dist.init()
-
     # Initialize config dict.
     c = dnnlib.EasyDict()
     c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
@@ -99,6 +107,8 @@ def main(**kwargs):
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
     c.optimizer_kwargs = dnnlib.EasyDict(class_name='torch.optim.Adam', lr=opts.lr, betas=[0.9,0.999], eps=1e-8)
+    # the extra arguments for the loss function
+    c.custom_kwargs = dnnlib.EasyDict(a=opts.a, b=opts.b, grad=opts.grad, gaussian=opts.gaussian)
 
     # Validate dataset options.
     try:
@@ -174,11 +184,11 @@ def main(**kwargs):
         c.resume_pkl = os.path.join(os.path.dirname(opts.resume), f'network-snapshot-{match.group(1)}.pkl')
         c.resume_kimg = int(match.group(1))
         c.resume_state_dump = opts.resume
-
+    
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
     dtype_str = 'fp16' if c.network_kwargs.use_fp16 else 'fp32'
-    desc = f'{dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
+    desc = f'{opts.dataset_name:s}-{cond_str:s}-{opts.arch:s}-{opts.precond:s}-gpus{dist.get_world_size():d}-batch{c.batch_size:d}-{dtype_str:s}'
     if opts.desc is not None:
         desc += f'-{opts.desc}'
 
@@ -210,6 +220,9 @@ def main(**kwargs):
     dist.print0(f'Number of GPUs:          {dist.get_world_size()}')
     dist.print0(f'Batch size:              {c.batch_size}')
     dist.print0(f'Mixed-precision:         {c.network_kwargs.use_fp16}')
+    dist.print0(f'Norm para a b:           {c.custom_kwargs.a}, {c.custom_kwargs.b}')
+    dist.print0(f'Use gradient map:        {c.custom_kwargs.grad}')
+    dist.print0(f'Use Gaussian noise:      {c.custom_kwargs.gaussian}')
     dist.print0()
 
     # Dry run?

@@ -12,6 +12,10 @@ import torch
 import warnings
 import dnnlib
 
+import os
+import PIL.Image
+from torchvision.utils import make_grid
+
 #----------------------------------------------------------------------------
 # Cached construction of constant tensors. Avoids CPU=>GPU copy when the
 # same constant is used multiple times.
@@ -263,4 +267,13 @@ def print_module_summary(module, inputs, max_nesting=3, skip_redundant=True):
     print()
     return outputs
 
+##################### newly added functions #####################
+def save_first_batch(dataset_iterator, run_dir):
+    first_images, _ = next(dataset_iterator) # n x c x h x w
+    if isinstance(first_images, (list, tuple)):
+        first_images = first_images[0]*2 - 1
+    first_images = first_images.reshape(-1, 1, first_images.shape[2], first_images.shape[3])
+    first_images = make_grid(first_images, nrow=4)
+    first_images = (first_images[0] * 127.5 + 128).clip(0, 255).to(torch.uint8).cpu().numpy()
+    PIL.Image.fromarray(first_images).save(os.path.join(run_dir, 'first.png'))
 #----------------------------------------------------------------------------
